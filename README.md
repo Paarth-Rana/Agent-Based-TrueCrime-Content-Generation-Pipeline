@@ -1,6 +1,6 @@
 # AI True Crime Story Generator
 
-An AI pipeline that automatically generates **documentary-style crime stories** from real historical events using **Wikipedia, LLMs, image generation, and text-to-speech**.
+An AI pipeline that automatically generates **documentary-style crime stories** based on real notorious criminals and crime cases using **Wikipedia, LLMs, image generation, and text-to-speech**.
 
 The system uses **LangGraph** to orchestrate a multi-step workflow that:
 1. Selects a real crime case
