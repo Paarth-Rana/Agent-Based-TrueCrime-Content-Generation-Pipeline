@@ -8,9 +8,7 @@ The system uses a multi-step workflow powered by **LangGraph**, where an AI agen
 
 ## What It Does
 
-Given an optional input topic, the pipeline:
-
-1. Selects a real true-crime case (or uses user input)  
+1. Selects a real true-crime case  
 2. Retrieves factual information from Wikipedia  
 3. Generates a structured narration script using an LLM  
 4. Splits the story into scenes  
@@ -43,6 +41,7 @@ This project focuses on **agent-based workflows**, where:
 
 ## Project Structure
 
+.
 ├── pipeline.py
 ├── utils.py
 ├── main.ipynb
@@ -60,7 +59,14 @@ from pipeline import run_pipeline
 
 state = run_pipeline("")
 ```
+
+### Option 2 (optional CLI)
+
+```python
+python run.py
+```
 ---
+
 
 ## Example Output
 
