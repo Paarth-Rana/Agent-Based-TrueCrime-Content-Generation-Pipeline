@@ -1,0 +1,12 @@
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+transformers==4.46.3
+accelerate==0.34.2
+diffusers==0.32.2
+langgraph
+soundfile
+numpy
+requests
+sentencepiece
+protobuf
