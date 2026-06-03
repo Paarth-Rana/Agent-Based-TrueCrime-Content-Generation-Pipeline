@@ -8,7 +8,7 @@ The system uses a multi-step workflow powered by **LangGraph**, where an AI agen
 
 ## What It Does
 
-1. Selects a real true-crime case (optionally guided by user input)
+1. Selects a real true-crime case or criminal from a **curated list** (or resolves your topic hint to that list)
 2. Retrieves factual information from Wikipedia  
 3. Generates a structured narration script using an LLM  
 4. Splits the story into scenes  
@@ -131,7 +131,8 @@ outputs/
 
 - Image generation is not always perfectly consistent with the story
 - Audio narration can sometimes sound unnatural or misaligned
-- Outputs may occasionally drift from the selected topic
+- Outputs may occasionally drift from the selected topic in generated script/images
+- Random topic pool is limited to the curated case list in `pipeline.py`
 - Final video stitching is not yet implemented
 
 This project is still being improved to increase consistency, realism, and reliability across all generated assets.

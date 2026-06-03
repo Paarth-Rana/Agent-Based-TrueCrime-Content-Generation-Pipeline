@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import random
 import torch
 import numpy as np
 import soundfile as sf
@@ -21,11 +22,6 @@ from utils import (
     clean_one_line,
     normalize_title_or_url,
     sanitize_search_query,
-    is_plausible_search_query,
-    is_valid_user_topic,
-    is_fiction_text,
-    is_fiction_description,
-    wiki_page_has_blocked_category,
     wiki_search,
     wiki_summary,
     extract_first_json_object,
@@ -113,65 +109,58 @@ def gen_image(prompt, path):
     ).images[0]
     img.save(path)
 
-BAD_PATTERNS = re.compile(
-    r"\b("
-    r"history of|timeline of|list of|overview|in the united states|in the u\.s\.|"
-    r"in (the )?united states|in america|by country|by state|"
-    r"prohibition|crime in|corruption in|politics of|"
-    r"mass incarceration|organized crime|gangs in|"
-    r"era|period|movement|"
-    r"category|outline"
-    r")\b",
-    re.I
-)
-
-GOOD_PATTERNS = re.compile(
-    r"\b("
-    r"murder|kidnapping|abduction|disappearance|heist|robbery|fraud|scandal|"
-    r"bombing|shooting|massacre|assassination|poisoning|conspiracy|"
-    r"killer|serial killer|murderer|con man|"
-    r"cult|hostage|terror|"
-    r"watergate|enron|theranos|"
-    r"hijacking|hijacker|ransom|extortion|"
-    r")\b",
-    re.I
-)
-
-REAL_WORLD_PATTERNS = re.compile(
-    r"\b("
-    r"convicted|sentenced|victim|perpetrator|arrested|investigation|"
-    r"unsolved|homicide|prison|prosecution|indicted|"
-    r"was killed|was murdered|disappeared|found guilty|"
-    r"police|detectives|fbi|court trial|criminal case"
-    r")\b",
-    re.I
-)
-
 BLOCKED_NS_PREFIXES = (
     "User:", "Wikipedia:", "Template:", "Draft:", "Talk:", "File:",
     "Help:", "Category:", "Portal:", "Module:", "TimedText:", "Media:",
     "Special:", "Book:", "Education Program:", "Gadget:", "Thread:",
 )
 
-MAX_TOPIC_ATTEMPTS = 4
 FALLBACK_TITLE = "D. B. Cooper"
 MIN_SUMMARY_CHARS = 80
+MAX_RANDOM_TRIES = 8
 
-FALLBACK_SEARCH_QUERIES = [
-    "famous 20th century murder case",
-    "unsolved kidnapping disappearance case",
-    "major corporate fraud scandal trial",
-    "serial killer investigation arrest",
-]
+DISAMBIGUATION = re.compile(r"disambiguation", re.I)
 
+# Famous real-world cases, criminals, and scandals (Wikipedia article titles).
+CURATED_CASES = (
+    "D. B. Cooper",
+    "Ted Bundy",
+    "Watergate scandal",
+    "Enron scandal",
+    "Zodiac Killer",
+    "Murder of Elizabeth Short",
+    "Lindbergh kidnapping",
+    "Bonnie and Clyde",
+    "O. J. Simpson murder case",
+    "Elizabeth Holmes",
+    "Ted Kaczynski",
+    "John Wayne Gacy",
+    "Boston Marathon bombing",
+    "Dennis Rader",
+    "Jack the Ripper",
+    "Lizzie Borden",
+    "Al Capone",
+    "Bernie Madoff",
+    "Golden State Killer",
+    "Leopold and Loeb",
+    "Sam Bankman-Fried",
+    "Murder of JonBenét Ramsey",
+    "Waco siege",
+    "Pan Am Flight 103",
+    "Disappearance of Malaysia Airlines Flight 370",
+    "Assassination of John F. Kennedy",
+    "Kidnapping of Patty Hearst",
+    "Great Train Robbery (1963)",
+    "Isabella Stewart Gardner Museum theft",
+    "Murder of Tupac Shakur",
+    "Murder of Gianni Versace",
+    "Harvey Weinstein sexual abuse cases",
+    "Volkswagen emissions scandal",
+    "Charles Manson",
+    "Jeffrey Dahmer",
+)
 
-def looks_like_specific(title: str) -> bool:
-    t = (title or "").strip()
-    if not t:
-        return False
-    if BAD_PATTERNS.search(t):
-        return False
-    return True
+_CURATED_BY_LOWER = {t.lower(): t for t in CURATED_CASES}
 
 
 def is_blocked_namespace(title: str) -> bool:
@@ -186,190 +175,88 @@ def is_blocked_namespace(title: str) -> bool:
     return False
 
 
-def has_crime_signal(title: str, snippet: str = "", description: str = "") -> bool:
-    blob = f"{title} {snippet} {description}"
-    if is_fiction_text(blob) or is_fiction_description(description):
-        return False
-    if GOOD_PATTERNS.search(blob):
-        return True
-    return bool(REAL_WORLD_PATTERNS.search(blob))
-
-
-def is_fiction_article(title: str, extract: str = "", description: str = "") -> bool:
-    blob = f"{title} {extract}"
-    if is_fiction_text(blob) or is_fiction_description(description):
-        return True
-    if wiki_page_has_blocked_category(title):
-        return True
-    return False
-
-
-def is_valid_crime_candidate(title: str, snippet: str = "") -> bool:
-    if not title or is_blocked_namespace(title):
-        return False
-    if not looks_like_specific(title):
-        return False
-    if is_fiction_text(f"{title} {snippet}"):
-        return False
-    return has_crime_signal(title, snippet)
-
-
-def is_valid_article(info: Dict[str, Any]) -> bool:
+def is_usable_wikipedia_article(info: Dict[str, Any]) -> bool:
     title = clean_one_line(info.get("title") or "")
     extract = (info.get("extract") or "").strip()
     description = clean_one_line(info.get("description") or "")
     if not title or is_blocked_namespace(title):
         return False
-    if not looks_like_specific(title):
-        return False
     if len(extract) < MIN_SUMMARY_CHARS:
         return False
-    if is_fiction_article(title, extract, description):
+    if DISAMBIGUATION.search(title) or DISAMBIGUATION.search(description):
         return False
-    return has_crime_signal(title, extract, description)
+    return True
 
 
-def match_candidate_title(picked: str, allowed_titles: list) -> str:
-    picked = normalize_title_or_url(picked)
-    if not picked:
-        return ""
-    by_lower = {t.lower(): t for t in allowed_titles}
-    return by_lower.get(picked.lower(), "")
+def _article_state(user_query: str, search_query: str, info: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "query": user_query or search_query,
+        "search_query": search_query,
+        "source_title": info["title"],
+        "source_url": info["url"],
+        "source_text": info["extract"],
+    }
 
 
-def score_candidate(title: str, snippet: str) -> int:
-    score = 0
-    if GOOD_PATTERNS.search(title):
-        score += 3
-    if GOOD_PATTERNS.search(snippet):
-        score += 2
-    if REAL_WORLD_PATTERNS.search(f"{title} {snippet}"):
-        score += 2
-    if is_fiction_text(f"{title} {snippet}"):
-        score -= 10
-    if re.search(r"\bin the\b", title, re.I):
-        score -= 2
-    if re.search(r"\bof the\b", title, re.I):
-        score -= 1
-    return score
-
-
-def _coerce_search_query(raw: str, attempt: int) -> str:
-    q = sanitize_search_query(raw)
-    if is_plausible_search_query(q):
-        return q
-    return FALLBACK_SEARCH_QUERIES[attempt % len(FALLBACK_SEARCH_QUERIES)]
-
-
-def _user_search_query(user_query: str) -> str:
-    q = sanitize_search_query(user_query)
-    if is_valid_user_topic(q):
-        return q
-    return ""
-
-
-def _search_candidates(search_q: str) -> list:
-    hits = wiki_search(search_q, limit=12)
-    out = []
-    for h in hits:
-        title = normalize_title_or_url((h.get("title") or "").strip())
-        if not title:
-            continue
-        snippet = clean_one_line(re.sub("<.*?>", "", h.get("snippet", "")))
-        if is_valid_crime_candidate(title, snippet):
-            out.append({"title": title, "snippet": snippet})
-    return out
-
-
-def _llm_search_query(user_seed: str, last_query: str, attempt: int) -> str:
-    avoid = f"\nDo NOT repeat this failed query: {last_query}" if last_query else ""
-    seed_line = f"\nUser requested topic (optional): {user_seed}" if user_seed else ""
-    prompt = f"""Return ONE Wikipedia search query only (4-10 words, keywords not a sentence).
-Topic must be a real criminal case, criminal, scandal, or heist (1900s+).
-No TV shows, films, books, or games. No quotes.{seed_line}{avoid}
-"""
-    raw = llm(prompt, max_new_tokens=16, temperature=0.2)
-    return _coerce_search_query(raw, attempt)
-
-
-def _pick_from_valid_candidates(valid: list) -> str:
-    if not valid:
-        return ""
-
-    scored = sorted(
-        [(score_candidate(c["title"], c.get("snippet", "")), c["title"], c.get("snippet", "")) for c in valid],
-        reverse=True,
-    )
-    top = scored[:8]
-    titles = [t for _, t, _ in top]
-    snippet_by_title = {t: sn for _, t, sn in top}
-
-    options = "\n".join([f"- {t}: {sn}" for _, t, sn in top])
-    prompt = f"""Pick ONE Wikipedia page title from the list below.
-Rules:
-- Must be EXACTLY one of the listed titles (copy verbatim)
-- Must be a REAL person, criminal case, scandal, or heist (not TV, film, book, or game)
-Return ONLY JSON: {{"title":"..."}}
-
-Options:
-{options}
-"""
-    try:
-        raw = llm(prompt, max_new_tokens=120, temperature=0.2)
-        obj = extract_first_json_object(raw) or {}
-        picked = match_candidate_title(normalize_title_or_url(obj.get("title", "")), titles)
-        if picked and is_valid_crime_candidate(picked, snippet_by_title.get(picked, "")):
-            return picked
-    except Exception:
-        pass
-
-    for _, t, sn in top:
-        if is_valid_crime_candidate(t, sn):
-            return t
-    return ""
-
-
-def _resolve_source(user_query: str, search_q: str, title: str) -> Dict[str, Any]:
+def _resolve_title(title: str, user_query: str, search_query: str) -> Dict[str, Any]:
     info = wiki_summary(title)
-    if is_valid_article(info):
-        return {
-            "query": user_query or search_q,
-            "search_query": search_q,
-            "source_title": info["title"],
-            "source_url": info["url"],
-            "source_text": info["extract"],
-        }
+    if is_usable_wikipedia_article(info):
+        return _article_state(user_query, search_query, info)
+    return {}
+
+
+def _pick_from_user_query(user_query: str) -> Dict[str, Any]:
+    q = sanitize_search_query(user_query)
+    if not q:
+        return {}
+
+    q_lower = q.lower()
+    for title in CURATED_CASES:
+        t_lower = title.lower()
+        if q_lower == t_lower or q_lower in t_lower or t_lower in q_lower:
+            resolved = _resolve_title(title, user_query=q, search_query=q)
+            if resolved:
+                return resolved
+
+    resolved = _resolve_title(q, user_query=q, search_query=q)
+    if resolved:
+        return resolved
+
+    for hit in wiki_search(q, limit=10):
+        title = normalize_title_or_url((hit.get("title") or "").strip())
+        canonical = _CURATED_BY_LOWER.get(title.lower())
+        if canonical:
+            resolved = _resolve_title(canonical, user_query=q, search_query=q)
+            if resolved:
+                return resolved
+
+    return {}
+
+
+def _pick_random_curated(user_query: str) -> Dict[str, Any]:
+    candidates = list(CURATED_CASES)
+    random.shuffle(candidates)
+    for title in candidates[:MAX_RANDOM_TRIES]:
+        resolved = _resolve_title(title, user_query=user_query, search_query=title)
+        if resolved:
+            return resolved
     return {}
 
 
 def node_discover_topic(state: Dict[str, Any]):
     user_query = clean_one_line(state.get("query") or "")
-    last_search = ""
 
-    for attempt in range(MAX_TOPIC_ATTEMPTS):
-        if user_query and attempt == 0:
-            search_q = _user_search_query(user_query) or _coerce_search_query("", attempt)
-        else:
-            search_q = _llm_search_query(user_query, last_search, attempt)
-        last_search = search_q
-
-        valid = _search_candidates(search_q)
-        picked = _pick_from_valid_candidates(valid)
-        if not picked:
-            continue
-
-        resolved = _resolve_source(user_query, search_q, picked)
+    if user_query:
+        resolved = _pick_from_user_query(user_query)
         if resolved:
             return resolved
 
+    resolved = _pick_random_curated(user_query)
+    if resolved:
+        return resolved
+
     info = wiki_summary(FALLBACK_TITLE)
-    return {
-        "query": user_query or FALLBACK_TITLE,
-        "search_query": FALLBACK_TITLE,
-        "source_title": info["title"],
-        "source_url": info["url"],
-        "source_text": info["extract"],
-    }
+    return _article_state(user_query, FALLBACK_TITLE, info)
 
 def node_write_script(state: Dict[str, Any]):
     title = clean_one_line(state.get("source_title", ""))
