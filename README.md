@@ -46,11 +46,48 @@ This project focuses on **agent-based workflows**, where:
 .
 ├── pipeline.py
 ├── utils.py
+├── colab_runner.ipynb   # GPU testing (Colab + Cursor via git)
 ├── main.ipynb
 ├── run.py
 ├── requirements.txt
 └── outputs/
 ```
+---
+
+## Cursor + Colab (GPU testing)
+
+Edit in **Cursor**, run on **Colab GPU** (no copy-paste). Git is the bridge.
+
+### One-time
+
+1. Push this repo to GitHub (already: `Paarth-Rana/Agent-Based-TrueCrime-Content-Generation-Pipeline`).
+2. Open [colab_runner.ipynb](colab_runner.ipynb) in Colab:
+   - Upload the file, or **File → Open notebook → GitHub** → paste the repo URL.
+3. **Runtime → Change runtime type → GPU**.
+4. Run all **Setup** cells once per Colab session (clone, optional Drive cache, load models).
+
+### After each code change in Cursor
+
+```bash
+git add pipeline.py utils.py   # files you changed
+git commit -m "your message"
+git push origin main
+```
+
+In Colab, run only the **Sync & test run** cell (pulls latest code, reloads module, runs pipeline).
+
+| When | Colab action |
+|------|----------------|
+| Changed `.py` files | **Sync & test run** cell only |
+| Changed `requirements.txt` | Re-run Setup + restart runtime |
+| Colab disconnected | Re-run all Setup cells |
+
+Models are **not** re-downloaded on every edit—only on new sessions (unless Hugging Face cache is on Google Drive; enable in the notebook).
+
+### Open in Colab badge
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Paarth-Rana/Agent-Based-TrueCrime-Content-Generation-Pipeline/blob/main/colab_runner.ipynb)
+
 ---
 
 ## How to Run
