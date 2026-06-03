@@ -124,13 +124,31 @@ GOOD_PATTERNS = re.compile(
     r"\b("
     r"murder|kidnapping|abduction|disappearance|heist|robbery|fraud|scandal|"
     r"bombing|shooting|massacre|assassination|poisoning|conspiracy|"
-    r"trial|case|affair|incident|attack|plot|"
+    r"trial|case|affair|incident|attack|"
     r"killer|serial killer|murderer|con man|"
     r"cult|hostage|terror|"
     r"watergate|enron|theranos|"
     r")\b",
     re.I
 )
+
+BLOCKED_NS_PREFIXES = (
+    "User:", "Wikipedia:", "Template:", "Draft:", "Talk:", "File:",
+    "Help:", "Category:", "Portal:", "Module:", "TimedText:", "Media:",
+    "Special:", "Book:", "Education Program:", "Gadget:", "Thread:",
+)
+
+MAX_TOPIC_ATTEMPTS = 4
+FALLBACK_TITLE = "D. B. Cooper"
+MIN_SUMMARY_CHARS = 80
+
+FALLBACK_SEARCH_QUERIES = [
+    "famous 20th century murder case",
+    "unsolved kidnapping disappearance case",
+    "major corporate fraud scandal trial",
+    "serial killer investigation arrest",
+]
+
 
 def looks_like_specific(title: str) -> bool:
     t = (title or "").strip()
@@ -140,76 +158,107 @@ def looks_like_specific(title: str) -> bool:
         return False
     return True
 
-def node_make_query(state: Dict[str, Any]):
-    seed = clean_one_line(state.get("query") or "")
-    prompt = f"""Pick ONE random compelling true-crime / mystery / criminal / scandal / heist topic
-that has a dedicated Wikipedia page and is mostly 1900s+ (OK: late 1800s).
-Return ONE Wikipedia search query (4–10 words), one line only, no quotes.
 
-User input (optional): {seed if seed else "(none)"}
-"""
-    q = normalize_query(llm(prompt, max_new_tokens=32, temperature=0.7))
-    if not q:
-        q = seed if seed else "famous 20th century heist"
-    return {"query": q}
+def is_blocked_namespace(title: str) -> bool:
+    t = (title or "").strip()
+    if not t:
+        return True
+    for prefix in BLOCKED_NS_PREFIXES:
+        if t.startswith(prefix):
+            return True
+    if "/drafts/" in t.lower():
+        return True
+    return False
 
-def node_search(state: Dict[str, Any]):
-    q = clean_one_line(state.get("query", ""))
-    hits = wiki_search(q, limit=12)
-    cands = [
-        {
-            "title": (h.get("title") or "").strip(),
-            "snippet": clean_one_line(re.sub("<.*?>", "", h.get("snippet", "")))
-        }
-        for h in hits
-    ]
-    cands = [c for c in cands if c["title"]]
-    return {"candidates": cands}
 
-def node_pick_source(state: Dict[str, Any]):
-    cands = state.get("candidates") or []
-    if not cands:
-        return {"source_title": "D. B. Cooper"}
+def has_crime_signal(title: str, snippet: str = "") -> bool:
+    return bool(GOOD_PATTERNS.search(f"{title} {snippet}"))
 
-    filtered = []
-    for c in cands:
-        title = normalize_title_or_url(c.get("title", ""))
+
+def is_valid_crime_candidate(title: str, snippet: str = "") -> bool:
+    if not title or is_blocked_namespace(title):
+        return False
+    if not looks_like_specific(title):
+        return False
+    return has_crime_signal(title, snippet)
+
+
+def is_valid_article(info: Dict[str, Any]) -> bool:
+    title = clean_one_line(info.get("title") or "")
+    extract = (info.get("extract") or "").strip()
+    if not title or is_blocked_namespace(title):
+        return False
+    if not looks_like_specific(title):
+        return False
+    if len(extract) < MIN_SUMMARY_CHARS:
+        return False
+    return has_crime_signal(title, extract)
+
+
+def match_candidate_title(picked: str, allowed_titles: list) -> str:
+    picked = normalize_title_or_url(picked)
+    if not picked:
+        return ""
+    by_lower = {t.lower(): t for t in allowed_titles}
+    return by_lower.get(picked.lower(), "")
+
+
+def score_candidate(title: str, snippet: str) -> int:
+    score = 0
+    if GOOD_PATTERNS.search(title):
+        score += 3
+    if GOOD_PATTERNS.search(snippet):
+        score += 2
+    if re.search(r"\bin the\b", title, re.I):
+        score -= 2
+    if re.search(r"\bof the\b", title, re.I):
+        score -= 1
+    return score
+
+
+def _search_candidates(search_q: str) -> list:
+    hits = wiki_search(search_q, limit=12)
+    out = []
+    for h in hits:
+        title = normalize_title_or_url((h.get("title") or "").strip())
         if not title:
             continue
-        if looks_like_specific(title):
-            filtered.append({"title": title, "snippet": c.get("snippet", "")})
+        snippet = clean_one_line(re.sub("<.*?>", "", h.get("snippet", "")))
+        if is_valid_crime_candidate(title, snippet):
+            out.append({"title": title, "snippet": snippet})
+    return out
 
-    if not filtered:
-        filtered = [
-            {"title": normalize_title_or_url(c.get("title", "")), "snippet": c.get("snippet", "")}
-            for c in cands if c.get("title")
-        ]
 
-    scored = []
-    for c in filtered:
-        t = c["title"]
-        sn = c.get("snippet") or ""
-        score = 0
-        if GOOD_PATTERNS.search(t):
-            score += 3
-        if GOOD_PATTERNS.search(sn):
-            score += 2
-        if re.search(r"\bin the\b", t, re.I):
-            score -= 2
-        if re.search(r"\bof the\b", t, re.I):
-            score -= 1
-        scored.append((score, t, sn))
+def _llm_search_query(user_seed: str, last_query: str, attempt: int) -> str:
+    avoid = f"\nDo NOT repeat this failed query: {last_query}" if last_query else ""
+    seed_line = f"\nUser requested topic (optional): {user_seed}" if user_seed else ""
+    prompt = f"""Pick ONE Wikipedia search query (4–10 words) for a specific true-crime / mystery /
+criminal case / scandal / heist page (1900s+, late 1800s ok). One line only, no quotes.{seed_line}{avoid}
+"""
+    q = normalize_query(llm(prompt, max_new_tokens=32, temperature=0.7))
+    if q:
+        return q
+    return FALLBACK_SEARCH_QUERIES[attempt % len(FALLBACK_SEARCH_QUERIES)]
 
-    scored.sort(reverse=True)
+
+def _pick_from_valid_candidates(valid: list) -> str:
+    if not valid:
+        return ""
+
+    scored = sorted(
+        [(score_candidate(c["title"], c.get("snippet", "")), c["title"], c.get("snippet", "")) for c in valid],
+        reverse=True,
+    )
     top = scored[:8]
+    titles = [t for _, t, _ in top]
+    snippet_by_title = {t: sn for _, t, sn in top}
 
     options = "\n".join([f"- {t}: {sn}" for _, t, sn in top])
-    prompt = f"""Pick ONE Wikipedia page title that is ONE specific person OR ONE specific case/event.
-Constraints:
-- Prefer 1900+ (late 1800s ok)
-- Avoid broad eras/categories (no “in the United States”, no “history of”, no “timeline of”, no “list of”)
+    prompt = f"""Pick ONE Wikipedia page title from the list below.
+Rules:
+- Must be EXACTLY one of the listed titles (copy verbatim)
+- Must be a specific true-crime / criminal case / scandal / heist
 Return ONLY JSON: {{"title":"..."}}
-Do NOT return a URL.
 
 Options:
 {options}
@@ -217,24 +266,58 @@ Options:
     try:
         raw = llm(prompt, max_new_tokens=120, temperature=0.2)
         obj = extract_first_json_object(raw) or {}
-        picked = normalize_title_or_url(obj.get("title", ""))
-        if picked and looks_like_specific(picked):
-            return {"source_title": picked}
+        picked = match_candidate_title(normalize_title_or_url(obj.get("title", "")), titles)
+        if picked and is_valid_crime_candidate(picked, snippet_by_title.get(picked, "")):
+            return picked
     except Exception:
         pass
 
-    for _, t, _ in top:
-        if looks_like_specific(t):
-            return {"source_title": t}
+    for _, t, sn in top:
+        if is_valid_crime_candidate(t, sn):
+            return t
+    return ""
 
-    return {"source_title": top[0][1]}
 
-def node_fetch_summary(state: Dict[str, Any]):
-    info = wiki_summary(state.get("source_title", ""))
+def _resolve_source(user_query: str, search_q: str, title: str) -> Dict[str, Any]:
+    info = wiki_summary(title)
+    if is_valid_article(info):
+        return {
+            "query": user_query or search_q,
+            "search_query": search_q,
+            "source_title": info["title"],
+            "source_url": info["url"],
+            "source_text": info["extract"],
+        }
+    return {}
+
+
+def node_discover_topic(state: Dict[str, Any]):
+    user_query = clean_one_line(state.get("query") or "")
+    last_search = ""
+
+    for attempt in range(MAX_TOPIC_ATTEMPTS):
+        if user_query and attempt == 0:
+            search_q = user_query
+        else:
+            search_q = _llm_search_query(user_query, last_search, attempt)
+        last_search = search_q
+
+        valid = _search_candidates(search_q)
+        picked = _pick_from_valid_candidates(valid)
+        if not picked:
+            continue
+
+        resolved = _resolve_source(user_query, search_q, picked)
+        if resolved:
+            return resolved
+
+    info = wiki_summary(FALLBACK_TITLE)
     return {
+        "query": user_query or FALLBACK_TITLE,
+        "search_query": FALLBACK_TITLE,
         "source_title": info["title"],
         "source_url": info["url"],
-        "source_text": info["extract"]
+        "source_text": info["extract"],
     }
 
 def node_write_script(state: Dict[str, Any]):
@@ -369,6 +452,7 @@ def node_generate_assets(state):
 
     manifest = {
         "query": state.get("query", ""),
+        "search_query": state.get("search_query", ""),
         "source_title": state.get("source_title", ""),
         "source_url": state.get("source_url", ""),
         "out_dir": folder,
@@ -388,7 +472,7 @@ def node_generate_assets(state):
 
 class StoryState(TypedDict, total=False):
     query: str
-    candidates: list
+    search_query: str
     source_title: str
     source_url: str
     source_text: str
@@ -402,20 +486,14 @@ class StoryState(TypedDict, total=False):
 
 def build_app():
     g = StateGraph(StoryState)
-    g.add_node("make_query", node_make_query)
-    g.add_node("search", node_search)
-    g.add_node("pick_source", node_pick_source)
-    g.add_node("fetch_summary", node_fetch_summary)
+    g.add_node("discover_topic", node_discover_topic)
     g.add_node("write_script", node_write_script)
     g.add_node("split_sections", node_split_sections)
     g.add_node("make_prompts", node_make_prompts)
     g.add_node("generate_assets", node_generate_assets)
 
-    g.set_entry_point("make_query")
-    g.add_edge("make_query", "search")
-    g.add_edge("search", "pick_source")
-    g.add_edge("pick_source", "fetch_summary")
-    g.add_edge("fetch_summary", "write_script")
+    g.set_entry_point("discover_topic")
+    g.add_edge("discover_topic", "write_script")
     g.add_edge("write_script", "split_sections")
     g.add_edge("split_sections", "make_prompts")
     g.add_edge("make_prompts", "generate_assets")
