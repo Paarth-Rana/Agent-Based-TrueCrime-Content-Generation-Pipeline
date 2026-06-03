@@ -4,6 +4,53 @@ import requests
 from urllib.parse import quote
 
 BASE_OUT = "outputs"
+MAX_SEARCH_QUERY_WORDS = 10
+MIN_SEARCH_QUERY_WORDS = 3
+
+FICTION_PATTERNS = re.compile(
+    r"\b("
+    r"television series|tv series|crime drama|drama series|miniseries|sitcom|"
+    r"video game|computer game|novel|novella|fictional character|animated series|"
+    r"premiered|aired on|created by|written by|directed by|"
+    r"season \d+|episodes?|starring|"
+    r"podcast series|film series|web series|"
+    r"British crime drama|American crime drama|"
+    r"video game franchise|role-playing game"
+    r")\b",
+    re.I,
+)
+
+INVALID_QUERY_PATTERNS = re.compile(
+    r"("
+    r"reported by the press|divorce from|daughter of|son of|husband |wife |"
+    r"^\d{1,2},\s*\d{4}\.|was reported|according to sources|"
+    r"in february|in january|in march|in april|in may|in june|"
+    r"in july|in august|in september|in october|in november|in december"
+    r")",
+    re.I,
+)
+
+DESCRIPTION_FICTION_PATTERNS = re.compile(
+    r"\b("
+    r"series|drama|film|movie|novel|game|podcast|television|miniseries|sitcom"
+    r")\b",
+    re.I,
+)
+
+BLOCKED_CATEGORY_FRAGMENTS = (
+    "television series",
+    "television programmes",
+    "television programs",
+    "films",
+    "video games",
+    "novels",
+    "fictional characters",
+    "bbc programmes",
+    "netflix",
+    "hbo",
+    "itv",
+)
+
 
 def clean_one_line(s: str) -> str:
     s = (s or "").strip()
@@ -17,6 +64,80 @@ def normalize_query(q: str) -> str:
     q = q.replace('"', '').replace("“", "").replace("”", "").strip()
     q = re.split(r"\b(SEARCH_QUERY|SEARCH QUERY|WIKI|WIKIPEDIA|LINK|URL)\b\s*:?", q, flags=re.I)[0].strip()
     return q
+
+
+def sanitize_search_query(q: str, max_words: int = MAX_SEARCH_QUERY_WORDS) -> str:
+    q = normalize_query(q)
+    if not q:
+        return ""
+    words = q.split()
+    if len(words) > max_words:
+        q = " ".join(words[:max_words])
+    return q.strip()
+
+
+def is_plausible_search_query(q: str) -> bool:
+    q = sanitize_search_query(q)
+    if not q:
+        return False
+    words = q.split()
+    if len(words) < MIN_SEARCH_QUERY_WORDS or len(words) > MAX_SEARCH_QUERY_WORDS:
+        return False
+    if INVALID_QUERY_PATTERNS.search(q):
+        return False
+    if is_fiction_text(q):
+        return False
+    return True
+
+
+def is_fiction_text(text: str) -> bool:
+    return bool(FICTION_PATTERNS.search(text or ""))
+
+
+def is_fiction_description(description: str) -> bool:
+    d = (description or "").strip()
+    if not d:
+        return False
+    return bool(DESCRIPTION_FICTION_PATTERNS.search(d))
+
+
+def is_valid_user_topic(q: str) -> bool:
+    q = sanitize_search_query(q)
+    if not q:
+        return False
+    if INVALID_QUERY_PATTERNS.search(q) or is_fiction_text(q):
+        return False
+    return True
+
+
+def wiki_page_has_blocked_category(title: str) -> bool:
+    title = normalize_title_or_url(title)
+    if not title:
+        return False
+    try:
+        r = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "titles": title,
+                "prop": "categories",
+                "cllimit": 50,
+                "format": "json",
+            },
+            headers={"User-Agent": "WikiLangGraphColab"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        pages = r.json().get("query", {}).get("pages", {})
+        for page in pages.values():
+            for cat in page.get("categories", []):
+                cat_title = (cat.get("title") or "").lower()
+                if any(frag in cat_title for frag in BLOCKED_CATEGORY_FRAGMENTS):
+                    return True
+    except Exception:
+        pass
+    return False
+
 
 def normalize_title_or_url(x: str) -> str:
     x = clean_one_line(x)
@@ -40,7 +161,7 @@ def wiki_search(query: str, limit: int = 12):
 def wiki_summary(title_or_url: str):
     title = normalize_title_or_url(title_or_url)
     if not title:
-        return {"title": "", "extract": "", "url": ""}
+        return {"title": "", "extract": "", "url": "", "description": ""}
 
     try:
         url = "https://en.wikipedia.org/api/rest_v1/page/summary/" + quote(title, safe="")
@@ -51,11 +172,12 @@ def wiki_summary(title_or_url: str):
                 "title": j.get("title", title),
                 "extract": (j.get("extract") or "").strip(),
                 "url": (j.get("content_urls", {}).get("desktop", {}) or {}).get("page", "") or "",
+                "description": (j.get("description") or "").strip(),
             }
     except Exception:
         pass
 
-    return {"title": title, "extract": "", "url": ""}
+    return {"title": title, "extract": "", "url": "", "description": ""}
 
 def extract_first_json_object(s: str):
     if not s:

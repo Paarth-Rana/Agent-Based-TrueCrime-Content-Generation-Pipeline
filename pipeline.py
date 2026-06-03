@@ -19,8 +19,13 @@ from langgraph.graph import StateGraph, END
 from utils import (
     BASE_OUT,
     clean_one_line,
-    normalize_query,
     normalize_title_or_url,
+    sanitize_search_query,
+    is_plausible_search_query,
+    is_valid_user_topic,
+    is_fiction_text,
+    is_fiction_description,
+    wiki_page_has_blocked_category,
     wiki_search,
     wiki_summary,
     extract_first_json_object,
@@ -124,10 +129,20 @@ GOOD_PATTERNS = re.compile(
     r"\b("
     r"murder|kidnapping|abduction|disappearance|heist|robbery|fraud|scandal|"
     r"bombing|shooting|massacre|assassination|poisoning|conspiracy|"
-    r"trial|case|affair|incident|attack|"
     r"killer|serial killer|murderer|con man|"
     r"cult|hostage|terror|"
     r"watergate|enron|theranos|"
+    r"hijacking|hijacker|ransom|extortion|"
+    r")\b",
+    re.I
+)
+
+REAL_WORLD_PATTERNS = re.compile(
+    r"\b("
+    r"convicted|sentenced|victim|perpetrator|arrested|investigation|"
+    r"unsolved|homicide|prison|prosecution|indicted|"
+    r"was killed|was murdered|disappeared|found guilty|"
+    r"police|detectives|fbi|court trial|criminal case"
     r")\b",
     re.I
 )
@@ -171,8 +186,22 @@ def is_blocked_namespace(title: str) -> bool:
     return False
 
 
-def has_crime_signal(title: str, snippet: str = "") -> bool:
-    return bool(GOOD_PATTERNS.search(f"{title} {snippet}"))
+def has_crime_signal(title: str, snippet: str = "", description: str = "") -> bool:
+    blob = f"{title} {snippet} {description}"
+    if is_fiction_text(blob) or is_fiction_description(description):
+        return False
+    if GOOD_PATTERNS.search(blob):
+        return True
+    return bool(REAL_WORLD_PATTERNS.search(blob))
+
+
+def is_fiction_article(title: str, extract: str = "", description: str = "") -> bool:
+    blob = f"{title} {extract}"
+    if is_fiction_text(blob) or is_fiction_description(description):
+        return True
+    if wiki_page_has_blocked_category(title):
+        return True
+    return False
 
 
 def is_valid_crime_candidate(title: str, snippet: str = "") -> bool:
@@ -180,19 +209,24 @@ def is_valid_crime_candidate(title: str, snippet: str = "") -> bool:
         return False
     if not looks_like_specific(title):
         return False
+    if is_fiction_text(f"{title} {snippet}"):
+        return False
     return has_crime_signal(title, snippet)
 
 
 def is_valid_article(info: Dict[str, Any]) -> bool:
     title = clean_one_line(info.get("title") or "")
     extract = (info.get("extract") or "").strip()
+    description = clean_one_line(info.get("description") or "")
     if not title or is_blocked_namespace(title):
         return False
     if not looks_like_specific(title):
         return False
     if len(extract) < MIN_SUMMARY_CHARS:
         return False
-    return has_crime_signal(title, extract)
+    if is_fiction_article(title, extract, description):
+        return False
+    return has_crime_signal(title, extract, description)
 
 
 def match_candidate_title(picked: str, allowed_titles: list) -> str:
@@ -209,11 +243,29 @@ def score_candidate(title: str, snippet: str) -> int:
         score += 3
     if GOOD_PATTERNS.search(snippet):
         score += 2
+    if REAL_WORLD_PATTERNS.search(f"{title} {snippet}"):
+        score += 2
+    if is_fiction_text(f"{title} {snippet}"):
+        score -= 10
     if re.search(r"\bin the\b", title, re.I):
         score -= 2
     if re.search(r"\bof the\b", title, re.I):
         score -= 1
     return score
+
+
+def _coerce_search_query(raw: str, attempt: int) -> str:
+    q = sanitize_search_query(raw)
+    if is_plausible_search_query(q):
+        return q
+    return FALLBACK_SEARCH_QUERIES[attempt % len(FALLBACK_SEARCH_QUERIES)]
+
+
+def _user_search_query(user_query: str) -> str:
+    q = sanitize_search_query(user_query)
+    if is_valid_user_topic(q):
+        return q
+    return ""
 
 
 def _search_candidates(search_q: str) -> list:
@@ -232,13 +284,12 @@ def _search_candidates(search_q: str) -> list:
 def _llm_search_query(user_seed: str, last_query: str, attempt: int) -> str:
     avoid = f"\nDo NOT repeat this failed query: {last_query}" if last_query else ""
     seed_line = f"\nUser requested topic (optional): {user_seed}" if user_seed else ""
-    prompt = f"""Pick ONE Wikipedia search query (4–10 words) for a specific true-crime / mystery /
-criminal case / scandal / heist page (1900s+, late 1800s ok). One line only, no quotes.{seed_line}{avoid}
+    prompt = f"""Return ONE Wikipedia search query only (4-10 words, keywords not a sentence).
+Topic must be a real criminal case, criminal, scandal, or heist (1900s+).
+No TV shows, films, books, or games. No quotes.{seed_line}{avoid}
 """
-    q = normalize_query(llm(prompt, max_new_tokens=32, temperature=0.7))
-    if q:
-        return q
-    return FALLBACK_SEARCH_QUERIES[attempt % len(FALLBACK_SEARCH_QUERIES)]
+    raw = llm(prompt, max_new_tokens=16, temperature=0.2)
+    return _coerce_search_query(raw, attempt)
 
 
 def _pick_from_valid_candidates(valid: list) -> str:
@@ -257,7 +308,7 @@ def _pick_from_valid_candidates(valid: list) -> str:
     prompt = f"""Pick ONE Wikipedia page title from the list below.
 Rules:
 - Must be EXACTLY one of the listed titles (copy verbatim)
-- Must be a specific true-crime / criminal case / scandal / heist
+- Must be a REAL person, criminal case, scandal, or heist (not TV, film, book, or game)
 Return ONLY JSON: {{"title":"..."}}
 
 Options:
@@ -297,7 +348,7 @@ def node_discover_topic(state: Dict[str, Any]):
 
     for attempt in range(MAX_TOPIC_ATTEMPTS):
         if user_query and attempt == 0:
-            search_q = user_query
+            search_q = _user_search_query(user_query) or _coerce_search_query("", attempt)
         else:
             search_q = _llm_search_query(user_query, last_search, attempt)
         last_search = search_q
@@ -329,7 +380,8 @@ def node_write_script(state: Dict[str, Any]):
     prompt = f"""Write a compelling, factual true-crime/mystery narration about: {title}
 
 Rules:
-- Use ONLY the SOURCE text. No inventions.
+- Use ONLY the SOURCE text. No inventions, no fictional characters, no TV plots.
+- Real events and people only.
 - 500–700 words.
 - Chronological, documentary tone.
 - Output narration only.
@@ -379,8 +431,7 @@ def node_make_prompts(state: Dict[str, Any]):
 
         prompt = f"""Return ONLY JSON:
 {{
-  "image_prompt": "realistic documentary photo prompt (<=240 chars)",
-  "narration": "60–95 words, only based on the section text"
+  "image_prompt": "realistic documentary photo prompt (<=240 chars)"
 }}
 
 Must-follow:
@@ -392,15 +443,13 @@ Must-follow:
 SECTION TEXT:
 {st}
 """
-        raw = llm(prompt, max_new_tokens=260, temperature=0.0)
+        raw = llm(prompt, max_new_tokens=200, temperature=0.0)
         obj = extract_first_json_object(raw) or {}
         ip = clean_one_line(obj.get("image_prompt", ""))
-        nar = clean_one_line(obj.get("narration", ""))
+        nar = st
 
         if title.lower() not in ip.lower():
             ip = f"{title}. {ip}" if ip else f"Documentary photo about {title}, realistic, natural lighting, no text"
-        if not nar:
-            nar = st
 
         out.append({
             "section_text": st,
